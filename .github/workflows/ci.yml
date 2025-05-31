@@ -1,4 +1,4 @@
-name: Python Tests
+name: Python Tests and Security Scans
 
 on:
   push:
@@ -20,22 +20,27 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: read
+
     steps:
-    - uses: actions/checkout@v3
-      
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.10'
-        
+        cache: 'pip'
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install virtualenv
         python -m virtualenv venv
         source venv/bin/activate
-        pip install pytest pip-audit
+        pip install pytest
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
     - name: Test with pytest
@@ -43,33 +48,51 @@ jobs:
         source venv/bin/activate
         pytest tests -v
 
-    - name: Security audit with pip-audit
+    - name: Run pip-audit manually
       run: |
         source venv/bin/activate
-        echo "Running pip-audit (informational only, will not fail the build)"
-        pip-audit > pip-audit-results.txt || echo "Security vulnerabilities found: outputting to build artifact txt file"
-        pip-audit --format json > pip-audit-results.json || echo "Security vulnerabilities found: outputting to build artifact detailed json file"
-        
+        pip install pip-audit
+        pip-audit -r requirements.txt -f json -o pip-audit-repo-results.json --vulnerability-service osv || true
+
     - name: Upload pip-audit scan results
       uses: actions/upload-artifact@v4
       with:
-        name: pip-audit-results
-        path: |
-          pip-audit-results.txt
-          pip-audit-results.json
-        
+        name: pip-audit-repo-results
+        path: pip-audit-repo-results.json
+        retention-days: 90
+
+    - name: Run Trivy filesystem scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'json'
+        output: 'trivy-fs-scan-results.json'
+        severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+        exit-code: '0'
+
+    - name: Upload Trivy filesystem scan JSON results
+      uses: actions/upload-artifact@v4
+      with:
+        name: trivy-fs-scan-results
+        path: trivy-fs-scan-results.json
+        retention-days: 90
+
   build:
     runs-on: ubuntu-latest
     needs: test
-    
+    permissions:
+      contents: read
+      packages: write  # If you need to push to GHCR
+
     steps:
-    - uses: actions/checkout@v3
-    
+    - uses: actions/checkout@v4
+
     - name: Set up Docker Build
-      uses: docker/setup-buildx-action@v2
-      
+      uses: docker/setup-buildx-action@v3
+
     - name: Build Docker image
-      uses: docker/build-push-action@v4
+      uses: docker/build-push-action@v5
       with:
         context: .
         push: false
@@ -77,18 +100,432 @@ jobs:
         tags: capstone-app:latest
         cache-from: type=gha
         cache-to: type=gha,mode=max
-    
-    - name: Run Trivy vulnerability scanner
+
+    - name: Run Trivy vulnerability scanner (Container Image)
       uses: aquasecurity/trivy-action@master
       with:
         image-ref: 'capstone-app:latest'
-        format: 'table'
+        format: 'json'
         exit-code: '0'
-        severity: 'CRITICAL,HIGH'
-        output: 'trivy-results.txt'
-        
-    - name: Upload Trivy scan results
+        scanners: 'vuln,misconfig,secret' # Ensure 'vuln' is included for vulnerability scanning
+        severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+        output: 'trivy-image-and-library-results.json'
+        vuln-type: 'os,library' # Scans OS packages and language-specific packages
+
+    - name: Upload Trivy scan results (Container Image)
       uses: actions/upload-artifact@v4
       with:
-        name: trivy-results
-        path: trivy-results.txt
+        name: trivy-image-and-library-results
+        path: trivy-image-and-library-results.json
+        retention-days: 90
+
+  security-report:
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    if: always()
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: security-reports
+
+    - name: Find and prepare JSON files
+      id: find-json
+      run: |
+        echo "--- Looking for JSON files ---"
+        find security-reports -type f -name "*.json" | sort
+        
+        mkdir -p security-reports/processed
+        
+        # Check for pip-audit results and copy or create placeholder
+        PIP_AUDIT_FILE=$(find security-reports -name "pip-audit-repo-results.json" -type f | head -n 1)
+        if [ -n "$PIP_AUDIT_FILE" ] && [ -s "$PIP_AUDIT_FILE" ]; then
+          echo "Found pip-audit file: $PIP_AUDIT_FILE"
+          if jq '.' "$PIP_AUDIT_FILE" > /dev/null 2>&1; then
+            cp "$PIP_AUDIT_FILE" security-reports/processed/pip-audit-repo-results.json
+            echo "Validated and copied pip-audit JSON."
+          else
+            echo "Error: pip-audit JSON is invalid. Creating placeholder."
+            echo '{"dependencies": []}' > security-reports/processed/pip-audit-repo-results.json
+          fi
+        else
+          echo "Creating placeholder for pip-audit (file not found or empty)"
+          echo '{"dependencies": []}' > security-reports/processed/pip-audit-repo-results.json
+        fi
+        
+        # Check for Trivy filesystem results and copy or create placeholder
+        TRIVY_FS_FILE=$(find security-reports -name "trivy-fs-scan-results.json" -type f | head -n 1)
+        if [ -n "$TRIVY_FS_FILE" ] && [ -s "$TRIVY_FS_FILE" ]; then
+          echo "Found Trivy FS file: $TRIVY_FS_FILE"
+          if jq '.' "$TRIVY_FS_FILE" > /dev/null 2>&1; then
+             cp "$TRIVY_FS_FILE" security-reports/processed/trivy-fs-scan-results.json
+             echo "Validated and copied Trivy FS JSON."
+          else
+            echo "Error: Trivy FS JSON is invalid. Creating placeholder."
+            echo '{"Results": []}' > security-reports/processed/trivy-fs-scan-results.json
+          fi
+        else
+          echo "Creating placeholder for Trivy FS (file not found or empty)"
+          echo '{"Results": []}' > security-reports/processed/trivy-fs-scan-results.json
+        fi
+        
+        # Check for Trivy container results and copy or create placeholder
+        TRIVY_IMG_FILE=$(find security-reports -name "trivy-image-and-library-results.json" -type f | head -n 1)
+        if [ -n "$TRIVY_IMG_FILE" ] && [ -s "$TRIVY_IMG_FILE" ]; then
+          echo "Found Trivy image file: $TRIVY_IMG_FILE"
+          if jq '.' "$TRIVY_IMG_FILE" > /dev/null 2>&1; then
+            cp "$TRIVY_IMG_FILE" security-reports/processed/trivy-image-and-library-results.json
+            echo "Validated and copied Trivy Image JSON."
+          else
+            echo "Error: Trivy Image JSON is invalid. Creating placeholder."
+            echo '{"Results": [], "Metadata": {"OS": {"Family": "unknown", "Name": "unknown"}}}' > security-reports/processed/trivy-image-and-library-results.json
+          fi
+        else
+          echo "Creating placeholder for Trivy image (file not found or empty)"
+          echo '{"Results": [], "Metadata": {"OS": {"Family": "unknown", "Name": "unknown"}}}' > security-reports/processed/trivy-image-and-library-results.json
+        fi
+        
+        echo "Files in processed directory:"
+        ls -la security-reports/processed/
+        
+        echo "pip_audit_path=security-reports/processed/pip-audit-repo-results.json" >> $GITHUB_OUTPUT
+        echo "trivy_fs_path=security-reports/processed/trivy-fs-scan-results.json" >> $GITHUB_OUTPUT
+        echo "trivy_img_path=security-reports/processed/trivy-image-and-library-results.json" >> $GITHUB_OUTPUT
+
+    - name: Create security report summary
+      env:
+        PIP_AUDIT_PATH: ${{ steps.find-json.outputs.pip_audit_path }}
+        TRIVY_FS_PATH: ${{ steps.find-json.outputs.trivy_fs_path }}
+        TRIVY_IMG_PATH: ${{ steps.find-json.outputs.trivy_img_path }}
+      run: |
+        echo "## 🔍 Security Scanning Results" > $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Install jq for JSON processing
+        echo "Installing jq for JSON processing..."
+        sudo apt-get update && sudo apt-get install -y jq
+        
+        # Initialize vulnerability counts
+        PIP_AUDIT_COUNT=0
+        TRIVY_FS_COUNT=0
+        TRIVY_IMG_COUNT=0
+        
+        echo "### 📊 Summary of Findings" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Scanner | Vulnerabilities Found | Format |" >> $GITHUB_STEP_SUMMARY
+        echo "|---------|----------------------|--------|" >> $GITHUB_STEP_SUMMARY
+        
+        # Get pip-audit vulnerability count
+        if [ -f "$PIP_AUDIT_PATH" ]; then
+          # Sum of lengths of .vulns arrays for all dependencies that have vulns
+          COUNT_VALUE=$(jq -e '[.dependencies[] | select(.vulns? and (.vulns | length > 0)) | .vulns | length] | add // 0' "$PIP_AUDIT_PATH" 2>/dev/null)
+          if [ $? -eq 0 ] && [ -n "$COUNT_VALUE" ]; then
+            PIP_AUDIT_COUNT=$COUNT_VALUE
+            echo "| pip-audit | $PIP_AUDIT_COUNT | JSON |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| pip-audit | Error parsing JSON or no vulns found | JSON |" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "| pip-audit | N/A (file missing) | JSON |" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        # Get Trivy filesystem vulnerability count
+        if [ -f "$TRIVY_FS_PATH" ]; then
+          COUNT_VALUE=$(jq -e '[.Results[]? | select(.Vulnerabilities? != null) | .Vulnerabilities | length] | add // 0' "$TRIVY_FS_PATH" 2>/dev/null)
+          if [ $? -eq 0 ] && [ -n "$COUNT_VALUE" ]; then
+            TRIVY_FS_COUNT=$COUNT_VALUE
+            echo "| Trivy (Filesystem) | $TRIVY_FS_COUNT | JSON |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Trivy (Filesystem) | Error parsing JSON or no vulns found | JSON |" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "| Trivy (Filesystem) | N/A (file missing) | JSON |" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        # Get Trivy container image vulnerability count
+        if [ -f "$TRIVY_IMG_PATH" ]; then
+          COUNT_VALUE=$(jq -e '[.Results[]? | select(.Vulnerabilities? != null) | .Vulnerabilities | length] | add // 0' "$TRIVY_IMG_PATH" 2>/dev/null)
+          if [ $? -eq 0 ] && [ -n "$COUNT_VALUE" ]; then
+            TRIVY_IMG_COUNT=$COUNT_VALUE
+            echo "| Trivy (Container) | $TRIVY_IMG_COUNT | JSON |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Trivy (Container) | Error parsing JSON or no vulns found | JSON |" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "| Trivy (Container) | N/A (file missing) | JSON |" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📦 Repository Scan Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Process pip-audit results
+        echo "#### 🔒 pip-audit Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ -f "$PIP_AUDIT_PATH" ] && jq '.' "$PIP_AUDIT_PATH" > /dev/null 2>&1; then
+          echo "<details>" >> $GITHUB_STEP_SUMMARY
+          echo "<summary>Click to view pip-audit vulnerability details (Found: $PIP_AUDIT_COUNT)</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$PIP_AUDIT_COUNT" -gt 0 ]; then
+            echo "**Vulnerable Packages:**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Package | Version | Vulnerabilities | Fix Versions |" >> $GITHUB_STEP_SUMMARY
+            echo "|---------|---------|----------------|-------------|" >> $GITHUB_STEP_SUMMARY
+            
+            jq -r '.dependencies[] | select(.vulns? and (.vulns | length > 0)) | "| \(.name) | \(.version) | \(.vulns | length) | \(.vulns | map(.fix_versions | join(", ")) | join("<br>")) |"' "$PIP_AUDIT_PATH" >> $GITHUB_STEP_SUMMARY \
+            || echo "| Error parsing package details | N/A | N/A | N/A |" >> $GITHUB_STEP_SUMMARY
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Detailed Vulnerabilities:**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            jq -r '.dependencies[] | select(.vulns? and (.vulns | length > 0)) | "- **\(.name) \(.version)**:\n\(.vulns | map("  * \(.id) - \(.description // "N/A") (Fix: \(.fix_versions | join(", ")))") | join("\n"))"' "$PIP_AUDIT_PATH" >> $GITHUB_STEP_SUMMARY \
+            || echo "Error parsing vulnerability details." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No vulnerabilities found by pip-audit." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "No pip-audit results found, file is empty, or JSON is invalid." >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Process Trivy filesystem scan
+        echo "#### 🔒 Trivy Filesystem Scan Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ -f "$TRIVY_FS_PATH" ] && jq '.' "$TRIVY_FS_PATH" > /dev/null 2>&1; then
+          echo "<details>" >> $GITHUB_STEP_SUMMARY
+          echo "<summary>Click to view Trivy filesystem vulnerabilities (Found: $TRIVY_FS_COUNT)</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$TRIVY_FS_COUNT" -gt 0 ]; then
+            echo "**Vulnerability Summary by Package Type/Target:**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Target | Type | Vulnerabilities |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|------|-----------------|" >> $GITHUB_STEP_SUMMARY
+            jq -r '.Results[]? | select(.Vulnerabilities? != null and (.Vulnerabilities | length > 0)) | "| \(.Target // "N/A") | \(.Type // "N/A") | \(.Vulnerabilities | length) |"' "$TRIVY_FS_PATH" >> $GITHUB_STEP_SUMMARY \
+            || echo "| Error parsing target details | N/A | N/A |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            echo "**Severity Distribution:**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            SEVERITY_DATA_FS=$(jq -r '
+              [.Results[]? | select(.Vulnerabilities != null) | .Vulnerabilities[]? | .Severity]
+              | if length > 0 then
+                  group_by(.)
+                  | map({severity: (.[0] // "N/A"), count: length})
+                  | sort_by(.count) | reverse
+                  | .[]
+                  | "| \(.severity) | \(.count) |"
+                else
+                  "| N/A | 0 |"
+                end
+            ' "$TRIVY_FS_PATH" 2>/dev/null)
+
+            if [ -n "$SEVERITY_DATA_FS" ]; then echo "$SEVERITY_DATA_FS" >> $GITHUB_STEP_SUMMARY; else echo "| Error processing severities | N/A |" >> $GITHUB_STEP_SUMMARY; fi
+          else
+            echo "No filesystem vulnerabilities found by Trivy." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "No Trivy filesystem scan results found, file is empty, or JSON is invalid." >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Process Trivy container scan
+        echo "### 🐳 Container Image Scan Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ -f "$TRIVY_IMG_PATH" ] && jq '.' "$TRIVY_IMG_PATH" > /dev/null 2>&1; then
+          echo "<details>" >> $GITHUB_STEP_SUMMARY
+          echo "<summary>Click to view Trivy container image vulnerabilities (Found: $TRIVY_IMG_COUNT)</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "**Container Image:** capstone-app:latest" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          OS_FAMILY=$(jq -r '.Metadata.OS.Family // "unknown"' "$TRIVY_IMG_PATH" 2>/dev/null)
+          OS_NAME=$(jq -r '.Metadata.OS.Name // "unknown"' "$TRIVY_IMG_PATH" 2>/dev/null)
+          OS_INFO="$OS_FAMILY $OS_NAME"
+          if [ "$OS_FAMILY" = "unknown" ] && [ "$OS_NAME" = "unknown" ]; then OS_INFO="Information not available or OS not found in metadata"; fi
+          echo "**OS:** $OS_INFO" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$TRIVY_IMG_COUNT" -gt 0 ]; then
+            echo "**Vulnerability Summary by Target:**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Target | Class | Type | Vulnerabilities |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|------|-----------------|" >> $GITHUB_STEP_SUMMARY
+            jq -r '.Results[]? | select(.Vulnerabilities? != null and (.Vulnerabilities | length > 0)) | "| \(.Target // "N/A") | \(.Class // "N/A") | \(.Type // "N/A") | \(.Vulnerabilities | length) |"' "$TRIVY_IMG_PATH" >> $GITHUB_STEP_SUMMARY \
+            || echo "| Error parsing target details | N/A | N/A | N/A |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            echo "**Severity Distribution:**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            SEVERITY_DATA_IMG=$(jq -r '
+              [.Results[]? | select(.Vulnerabilities != null) | .Vulnerabilities[]? | .Severity]
+              | if length > 0 then
+                  group_by(.)
+                  | map({severity: (.[0] // "N/A"), count: length})
+                  | sort_by(.count) | reverse
+                  | .[]
+                  | "| \(.severity) | \(.count) |"
+                else
+                  "| N/A | 0 |"
+                end
+            ' "$TRIVY_IMG_PATH" 2>/dev/null)
+            if [ -n "$SEVERITY_DATA_IMG" ]; then echo "$SEVERITY_DATA_IMG" >> $GITHUB_STEP_SUMMARY; else echo "| Error processing severities | N/A |" >> $GITHUB_STEP_SUMMARY; fi
+          else
+            echo "No container image vulnerabilities found by Trivy." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "No Trivy container scan results found, file is empty, or JSON is invalid." >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Security Tool Comparison
+        echo "### 📊 Security Tool Comparison" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Feature | pip-audit | Trivy |" >> $GITHUB_STEP_SUMMARY
+        echo "|---------|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| **Focus** | Python packages | Containers, filesystems, code, Python packages |" >> $GITHUB_STEP_SUMMARY
+        TOTAL_TRIVY_COUNT=$((TRIVY_FS_COUNT + TRIVY_IMG_COUNT))
+        echo "| **Vulnerabilities Found (in this run)** | $PIP_AUDIT_COUNT | $TOTAL_TRIVY_COUNT |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Primary Data Source(s)** | PyPI, OSV | Multiple CVE DBs, vendor advisories |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Fix Information** | Version-specific | Version-specific, detailed advice |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Scan Speed (General)** | Fast | Medium-Slow (depending on scope) |" >> $GITHUB_STEP_SUMMARY
+        echo "| **JSON Schema Complexity** | Simple | Complex |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Typical Use Case** | Python dependency scanning | Comprehensive multi-faceted scanning |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Tool Feature Comparison
+        echo "#### Tool Feature Comparison" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Feature | pip-audit | Trivy |" >> $GITHUB_STEP_SUMMARY
+        echo "|---------|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| **Python Dependency Analysis** | ✅ | ✅ |" >> $GITHUB_STEP_SUMMARY
+        echo "| **OS Package Analysis** | ❌ | ✅ |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Container Image Analysis** | ❌ | ✅ |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Filesystem Scanning** | ❌ | ✅ |" >> $GITHUB_STEP_SUMMARY
+        echo "| **SBOM Generation** | ❌ | ✅ |" >> $GITHUB_STEP_SUMMARY
+        echo "| **License Compliance** | ❌ | ✅ |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Secrets Detection** | ❌ | ✅ |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Misconfiguration Detection** | ❌ | ✅ |" >> $GITHUB_STEP_SUMMARY
+        echo "| **CI/CD Integration** | ✅ | ✅ |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Tool Output & JSON Schema Overview
+        echo "### 📄 Tool Output & JSON Schema Overview" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Both pip-audit and Trivy output JSON format, making them ideal for programmatic analysis and integration with security dashboards." >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        echo "**pip-audit JSON Schema:** Focuses on Python dependencies, listing each with its vulnerabilities." >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+        cat <<EOF >> $GITHUB_STEP_SUMMARY
+        {
+          "dependencies": [
+            {
+              "name": "package-name",
+              "version": "1.2.3",
+              "vulns": [
+                {
+                  "id": "CVE-2023-12345",
+                  "description": "Vulnerability description",
+                  "fix_versions": ["1.2.4", "1.3.0"]
+                }
+              ]
+            }
+          ]
+        }
+        EOF
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        echo "**Trivy JSON Schema:** More comprehensive, with a \`Results\` array. Each result can be for an OS, package type, etc., and contains a list of vulnerabilities." >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+        cat <<EOF >> $GITHUB_STEP_SUMMARY
+        {
+          "SchemaVersion": 2,
+          "ArtifactName": "your-image:latest or .",
+          "ArtifactType": "container_image or filesystem",
+          "Metadata": {
+            "OS": { "Family": "alpine", "Name": "3.18.0" },
+            "ImageConfig": { /* Docker image config */ }
+          },
+          "Results": [
+            {
+              "Target": "alpine:3.18.0 (alpine 3.18.0)",
+              "Class": "os-pkgs",
+              "Type": "alpine",
+              "Vulnerabilities": [ /* List of OS vulnerabilities */ ]
+            },
+            {
+              "Target": "usr/local/lib/python3.10/site-packages/requirements.txt",
+              "Class": "lang-pkgs",
+              "Type": "pip",
+              "Vulnerabilities": [
+                {
+                  "VulnerabilityID": "CVE-2023-12345",
+                  "PkgName": "package-name",
+                  "InstalledVersion": "1.2.3",
+                  "FixedVersion": "1.2.4",
+                  "Layer": { "Digest": "sha256:...", "DiffID": "sha256:..." },
+                  "SeveritySource": "nvd",
+                  "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2023-12345",
+                  "DataSource": { "ID": "glad", "Name": "GitHub Advisory Database", "URL": "https://github.com/advisories" },
+                  "Title": "Title of the vulnerability",
+                  "Description": "Detailed description of the vulnerability.",
+                  "Severity": "HIGH",
+                  "CweIDs": ["CWE-79"],
+                  "VendorSeverity": {},
+                  "CVSS": {},
+                  "References": [],
+                  "PublishedDate": "2023-01-01T00:00:00Z",
+                  "LastModifiedDate": "2023-01-10T00:00:00Z"
+                }
+              ]
+            }
+          ]
+        }
+        EOF
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Add artifact download instructions
+        echo "### 📥 Accessing Full JSON Reports" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "The complete JSON reports for each security scan are available as artifacts from this workflow run." >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**To download the artifacts:**" >> $GITHUB_STEP_SUMMARY
+        echo "1. Go to the Actions tab in the GitHub repository" >> $GITHUB_STEP_SUMMARY
+        echo "2. Select this workflow run" >> $GITHUB_STEP_SUMMARY
+        echo "3. Scroll down to the Artifacts section" >> $GITHUB_STEP_SUMMARY
+        echo "4. Download any of the following artifacts:" >> $GITHUB_STEP_SUMMARY
+        echo "   - pip-audit-repo-results" >> $GITHUB_STEP_SUMMARY
+        echo "   - trivy-fs-scan-results" >> $GITHUB_STEP_SUMMARY
+        echo "   - trivy-image-and-library-results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Debug information
+        echo "### 🔍 Debug Information" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "<details>" >> $GITHUB_STEP_SUMMARY
+        echo "<summary>Processed files directory structure</summary>" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        find security-reports/processed -type f | sort >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        echo "</details>" >> $GITHUB_STEP_SUMMARY
